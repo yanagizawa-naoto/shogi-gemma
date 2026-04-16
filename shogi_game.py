@@ -72,7 +72,12 @@ class GameState:
 
     @property
     def is_over(self) -> bool:
-        return self.board.is_game_over() or len(self.history) >= 400
+        return (
+            self.board.is_checkmate()
+            or self.board.is_stalemate()
+            or self.board.is_fourfold_repetition()
+            or len(self.history) >= 1500  # safety cap: abandon if neither side can progress
+        )
 
     @property
     def turn(self) -> int:
@@ -103,15 +108,20 @@ class GameState:
             "was_in_check_before": is_check,
         })
 
-    def winner(self) -> int | None:
-        """Returns the winner's color, or 0 for draw, or None if game still on."""
+    def winner(self):
+        """Returns BLACK / WHITE / 'sennichite' / 'abandoned' / None.
+
+        - checkmate / stalemate → the side NOT to move just won
+        - fourfold repetition → 'sennichite' (true shogi-rule draw)
+        - move cap (1500) hit → 'abandoned' (Gemma couldn't finish)
+        """
         if not self.is_over:
             return None
-        if self.board.is_checkmate():
-            # The side to move just got checkmated → other side wins
+        if self.board.is_checkmate() or self.board.is_stalemate():
             return 1 - self.board.turn
-        # draw / impasse / move limit
-        return 0
+        if self.board.is_fourfold_repetition():
+            return "sennichite"
+        return "abandoned"
 
 
 def board_from_sfen(sfen: str) -> shogi.Board:

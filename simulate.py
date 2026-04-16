@@ -44,6 +44,7 @@ CFG = {
 
 # Sentinel string for a drawn game (so it can't collide with shogi.BLACK=0).
 DRAW = "draw"
+CALL_TIMEOUT = 120.0  # hard timeout per API call (Thinker needs long)
 
 
 def build_user_msg(board: shogi.Board, legal_usi: list[str]) -> str:
@@ -87,7 +88,14 @@ async def call_model(client, style, board, legal_usi, stats, max_retries=2):
             },
         }
         t0 = time.monotonic()
-        resp = await client.post(f"{BASE_URL}/chat/completions", json=payload)
+        try:
+            resp = await asyncio.wait_for(
+                client.post(f"{BASE_URL}/chat/completions", json=payload),
+                timeout=CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            stats["call_timeouts"] = stats.get("call_timeouts", 0) + 1
+            raise httpx.ReadTimeout(f"call_model timeout after {CALL_TIMEOUT}s")
         latency = time.monotonic() - t0
         stats["latency_sum"] += latency
         stats["latency_count"] += 1
@@ -141,14 +149,18 @@ async def play_game(game_id, client, semaphore, side_assignment, stats, results)
                 )
                 g.play(move_str, retries=retries, forced_fallback=fb)
                 move_count += 1
-            winner_color = g.winner()  # shogi.BLACK / shogi.WHITE / 0 / None
-            if winner_color == 0:
-                winner_style = DRAW
+            w = g.winner()  # shogi.BLACK / shogi.WHITE / 'sennichite' / 'abandoned' / None
+            if w == "sennichite":
+                winner_style = "sennichite"
+            elif w == "abandoned":
+                winner_style = "abandoned"
+            elif w in (shogi.BLACK, shogi.WHITE):
+                winner_style = side_assignment[w]
             else:
-                winner_style = side_assignment[winner_color]
+                winner_style = "unknown"
             results[game_id] = {
                 "winner_style": winner_style,
-                "winner_color": winner_color,
+                "winner_color": w,
                 "sente_style": side_assignment[shogi.BLACK],
                 "moves": move_count,
                 "error": None,
@@ -178,8 +190,9 @@ async def monitor(stats, results, n_games, start_t):
             f"[{elapsed:5.0f}s] games={done}/{n_games} | "
             f"calls={stats['calls']} ({rate:.1f}/s, avg={avg_latency:.1f}s) | "
             f"retries={stats['retries']} fb={stats['fallbacks']} | "
-            f"http_err={stats['http_errors']} game_err={stats['game_errors']} | "
-            f"Q={ws.get('quick', 0)} T={ws.get('thinker', 0)} D={ws.get(DRAW, 0)}",
+            f"http_err={stats['http_errors']} call_to={stats['call_timeouts']} game_err={stats['game_errors']} | "
+            f"Q={ws.get('quick', 0)} T={ws.get('thinker', 0)} "
+            f"S={ws.get('sennichite', 0)} A={ws.get('abandoned', 0)}",
             flush=True,
         )
         if done >= n_games:
@@ -199,7 +212,7 @@ async def main(n_games: int = 100, concurrency: int = 20):
 
     stats = {
         "calls": 0, "retries": 0, "fallbacks": 0,
-        "http_errors": 0, "game_errors": 0,
+        "http_errors": 0, "game_errors": 0, "call_timeouts": 0,
         "latency_sum": 0.0, "latency_count": 0,
     }
     results: dict[int, dict | None] = {i: None for i in range(n_games)}
@@ -238,7 +251,9 @@ async def main(n_games: int = 100, concurrency: int = 20):
     # Per-side breakdowns
     when_quick_sente = Counter()   # outcomes when Quick=sente
     when_thinker_sente = Counter() # outcomes when Thinker=sente
-    moves_by_winner: dict[str, list[int]] = {"quick": [], "thinker": [], DRAW: []}
+    moves_by_winner: dict[str, list[int]] = {
+        "quick": [], "thinker": [], "sennichite": [], "abandoned": [],
+    }
     errors = []
 
     for r in results.values():
@@ -265,18 +280,21 @@ async def main(n_games: int = 100, concurrency: int = 20):
     print("=" * 60)
     print(f"  ▲ Quick   wins (any side): {style_counter.get('quick', 0):>4}  (avg {avg_moves(moves_by_winner['quick'])} moves)")
     print(f"  △ Thinker wins (any side): {style_counter.get('thinker', 0):>4}  (avg {avg_moves(moves_by_winner['thinker'])} moves)")
-    print(f"  🤝 Draws                   : {style_counter.get(DRAW, 0):>4}  (avg {avg_moves(moves_by_winner[DRAW])} moves)")
+    print(f"  🔁 Sennichite (千日手)     : {style_counter.get('sennichite', 0):>4}  (avg {avg_moves(moves_by_winner['sennichite'])} moves)")
+    print(f"  🚫 Abandoned (1500手到達)   : {style_counter.get('abandoned', 0):>4}  (avg {avg_moves(moves_by_winner['abandoned'])} moves)")
     print(f"  ⚠️ Errors                  : {style_counter.get('error', 0):>4}")
     print()
     print("--- Breakdown by sente assignment ---")
     print(f"When Quick = sente ({sum(when_quick_sente.values())} games):")
     print(f"  Quick wins   : {when_quick_sente.get('quick', 0)}")
     print(f"  Thinker wins : {when_quick_sente.get('thinker', 0)}")
-    print(f"  Draws        : {when_quick_sente.get(DRAW, 0)}")
+    print(f"  Sennichite   : {when_quick_sente.get('sennichite', 0)}")
+    print(f"  Abandoned    : {when_quick_sente.get('abandoned', 0)}")
     print(f"When Thinker = sente ({sum(when_thinker_sente.values())} games):")
     print(f"  Quick wins   : {when_thinker_sente.get('quick', 0)}")
     print(f"  Thinker wins : {when_thinker_sente.get('thinker', 0)}")
-    print(f"  Draws        : {when_thinker_sente.get(DRAW, 0)}")
+    print(f"  Sennichite   : {when_thinker_sente.get('sennichite', 0)}")
+    print(f"  Abandoned    : {when_thinker_sente.get('abandoned', 0)}")
     print()
     print(f"Total API calls : {stats['calls']}")
     print(f"Avg latency     : {stats['latency_sum'] / max(stats['latency_count'], 1):.2f}s")
@@ -284,6 +302,7 @@ async def main(n_games: int = 100, concurrency: int = 20):
     print(f"Retries         : {stats['retries']}")
     print(f"Fallbacks       : {stats['fallbacks']}")
     print(f"HTTP errors     : {stats['http_errors']}")
+    print(f"Call timeouts   : {stats['call_timeouts']}")
     print(f"Game errors     : {stats['game_errors']}")
     if errors:
         print()
