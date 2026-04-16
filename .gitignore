@@ -1,0 +1,10 @@
+.env
+.env.local
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.playwright-mcp/
+*.png
+*.jpg
+.DS_Store

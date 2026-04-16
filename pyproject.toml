@@ -1,0 +1,11 @@
+[project]
+name = "shogi-gemma"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+    "python-shogi>=1.1.1",
+    "streamlit>=1.56.0",
+]
